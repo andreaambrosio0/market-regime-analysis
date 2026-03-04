@@ -1,4 +1,4 @@
-# Market Regime Analysis — Institutional Grade
+# Market Regime Analysis 
 
 Binary regime classification (**BULLISH** / **BEARISH**) for crypto markets using 18 sub-signals with BTC as the dominant signal (70% weight) and altcoins providing confirmation (30% weight).
 

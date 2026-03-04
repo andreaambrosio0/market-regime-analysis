@@ -353,12 +353,14 @@ def build_features(df):
     feat["btc_rv_90d"] = btc["rv_90d"]
     feat["btc_volume_ratio"] = btc["volume_ratio"]
 
-    # Moving averages for trend
-    feat["btc_ma_50"] = btc["price"].rolling(50).mean()
-    feat["btc_ma_200"] = btc["price"].rolling(200).mean()
-    feat["btc_above_50ma"] = (btc["price"] > feat["btc_ma_50"]).astype(float)
-    feat["btc_above_200ma"] = (btc["price"] > feat["btc_ma_200"]).astype(float)
-    feat["btc_ma_cross"] = (feat["btc_ma_50"] > feat["btc_ma_200"]).astype(float)
+    # Moving averages for trend — crypto-adapted (faster than equities)
+    feat["btc_ema_21"] = btc["price"].ewm(span=21).mean()
+    feat["btc_ema_50"] = btc["price"].ewm(span=50).mean()
+    feat["btc_ma_50"] = btc["price"].rolling(50).mean()  # kept for charting
+    feat["btc_ma_200"] = btc["price"].rolling(200).mean()  # kept for charting only
+    feat["btc_above_21ema"] = (btc["price"] > feat["btc_ema_21"]).astype(float)
+    feat["btc_above_50ema"] = (btc["price"] > feat["btc_ema_50"]).astype(float)
+    feat["btc_ema_cross"] = (feat["btc_ema_21"] > feat["btc_ema_50"]).astype(float)
 
     # --- Altcoin features ---
     alt_ret_30 = alts.groupby("time")["return_30d"].median().rename("alt_return_30d")
@@ -384,7 +386,7 @@ def build_features(df):
               breadth_7d, breadth_30d, vol_zscore, total_vol]:
         feat = feat.join(s, how="left")
 
-    feat = feat.dropna(subset=["btc_return_30d", "btc_rv_30d", "btc_ma_200",
+    feat = feat.dropna(subset=["btc_return_30d", "btc_rv_30d", "btc_ema_50",
                                 "breadth_30d", "alt_return_30d"])
     feat.index.name = "time"
     feat = feat.reset_index()
@@ -412,8 +414,8 @@ def compute_regime(feat):
     BTC Component (70% weight) — 10 sub-signals, each ∈ {-1, +1}:
       1. Trend:     30d return > 0 → +1, else -1
       2. Momentum:  7d return > 0 → +1, else -1
-      3. MA Cross:  50MA > 200MA (golden cross) → +1, else -1
-      4. Price>200MA: price above 200-day MA → +1, else -1
+      3. EMA Cross: 21-EMA > 50-EMA → +1, else -1 (fast trend)
+      4. Price>50EMA: price above 50-day EMA → +1, else -1
       5. Vol level: rv_30d < historical median → +1, else -1
       6. Vol trend: rv_30d < rv_90d (declining vol) → +1, else -1
       7. Mid-term:  60d return > 0 → +1, else -1
@@ -444,8 +446,8 @@ def compute_regime(feat):
     # BTC sub-signals
     f["btc_s_trend"] = np.where(f["btc_return_30d"] > 0, 1, -1)
     f["btc_s_momentum"] = np.where(f["btc_return_7d"] > 0, 1, -1)
-    f["btc_s_ma_cross"] = np.where(f["btc_ma_cross"] == 1, 1, -1)
-    f["btc_s_above_200ma"] = np.where(f["btc_above_200ma"] == 1, 1, -1)
+    f["btc_s_ema_cross"] = np.where(f["btc_ema_cross"] == 1, 1, -1)
+    f["btc_s_above_50ema"] = np.where(f["btc_above_50ema"] == 1, 1, -1)
     f["btc_s_vol_level"] = np.where(f["btc_rv_30d"] < rv_med, 1, -1)
     f["btc_s_vol_trend"] = np.where(f["btc_rv_30d"] < f["btc_rv_90d"], 1, -1)
     f["btc_s_midterm"] = np.where(f["btc_return_60d"] > 0, 1, -1)
@@ -472,8 +474,8 @@ def compute_regime(feat):
     f["btc_s_vol_price"] = f["btc_s_vol_price"].replace(0, np.nan).fillna(
         method="ffill").fillna(0)
 
-    btc_signals = ["btc_s_trend", "btc_s_momentum", "btc_s_ma_cross",
-                   "btc_s_above_200ma", "btc_s_vol_level", "btc_s_vol_trend",
+    btc_signals = ["btc_s_trend", "btc_s_momentum", "btc_s_ema_cross",
+                   "btc_s_above_50ema", "btc_s_vol_level", "btc_s_vol_trend",
                    "btc_s_midterm", "btc_s_rv_term", "btc_s_hurst_trend",
                    "btc_s_vol_price"]
     f["btc_score"] = f[btc_signals].mean(axis=1)
@@ -748,7 +750,7 @@ def make_all_charts(feat, bt, df_raw, ystats):
     ax_btc = fig.add_subplot(gs[0, 0]); ax_btc.axis("off")
     ax_btc.set_title("BTC SIGNALS (70%)", fontsize=11, fontweight="bold")
     btc_sigs = [("30d Trend", latest["btc_s_trend"]), ("7d Momentum", latest["btc_s_momentum"]),
-                ("Golden Cross", latest["btc_s_ma_cross"]), (">200MA", latest["btc_s_above_200ma"]),
+                ("EMA Cross", latest["btc_s_ema_cross"]), (">50 EMA", latest["btc_s_above_50ema"]),
                 ("Low Vol", latest["btc_s_vol_level"]), ("Vol Declining", latest["btc_s_vol_trend"]),
                 ("60d Trend", latest["btc_s_midterm"]), ("RV Term Str", latest["btc_s_rv_term"]),
                 ("Hurst+Trend", latest["btc_s_hurst_trend"]), ("Vol-Price", latest["btc_s_vol_price"])]
@@ -1199,24 +1201,25 @@ def make_all_charts(feat, bt, df_raw, ystats):
     # --- Slide 16: BTC Moving Averages ---
     fig, ax = plt.subplots(figsize=(22, 8))
     ax.plot(times, feat["btc_price"], color=C_BTC, linewidth=1, alpha=0.8, label="BTC Price")
-    ax.plot(times, feat["btc_ma_50"], color="#58a6ff", linewidth=1.2, alpha=0.8, label="50-day MA")
-    ax.plot(times, feat["btc_ma_200"], color="#e74c3c", linewidth=1.2, alpha=0.8, label="200-day MA")
+    ax.plot(times, feat["btc_ema_21"], color="#2ecc71", linewidth=1.2, alpha=0.9, label="21-day EMA (fast)")
+    ax.plot(times, feat["btc_ema_50"], color="#58a6ff", linewidth=1.2, alpha=0.9, label="50-day EMA (signal)")
+    ax.plot(times, feat["btc_ma_200"], color="#e74c3c", linewidth=0.8, alpha=0.4, linestyle="--", label="200-day SMA (ref only)")
     ax.set_yscale("log")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-    ax.set_title("BTC PRICE with 50-DAY and 200-DAY MOVING AVERAGES", fontsize=13, fontweight="bold", pad=10)
+    ax.set_title("BTC PRICE with 21/50 EMA (Used in Model) + 200 SMA (Reference Only)", fontsize=13, fontweight="bold", pad=10)
     ax.legend(fontsize=10, framealpha=0.3)
     ax.grid(True, alpha=0.3)
-    golden_crosses = ((feat["btc_ma_cross"] == 1) & (feat["btc_ma_cross"].shift(1) == 0)).sum()
-    death_crosses = ((feat["btc_ma_cross"] == 0) & (feat["btc_ma_cross"].shift(1) == 1)).sum()
-    currently_golden = feat.iloc[-1]["btc_ma_cross"] == 1
+    ema_crosses_up = ((feat["btc_ema_cross"] == 1) & (feat["btc_ema_cross"].shift(1) == 0)).sum()
+    ema_crosses_dn = ((feat["btc_ema_cross"] == 0) & (feat["btc_ema_cross"].shift(1) == 1)).sum()
+    currently_bullish_ema = feat.iloc[-1]["btc_ema_cross"] == 1
     add_insight(ax, 0.01, 0.30,
-                f"Golden crosses (50MA > 200MA): {golden_crosses} occurrences | Death crosses: {death_crosses}\n"
-                f"Current state: {'GOLDEN CROSS (bullish structure)' if currently_golden else 'DEATH CROSS (bearish structure)'}\n"
-                f"The 200MA acts as a long-term trend anchor — BTC spending extended time below it (2018, 2022)\n"
-                f"signals structural bear markets. Current position relative to 200MA is a key regime driver.",
+                f"EMA cross-ups (21EMA > 50EMA): {ema_crosses_up} | Cross-downs: {ema_crosses_dn}\n"
+                f"Current state: {'21EMA > 50EMA (bullish trend)' if currently_bullish_ema else '21EMA < 50EMA (bearish trend)'}\n"
+                f"EMAs react faster than SMAs — the 21/50 EMA pair captures crypto's faster cycles.\n"
+                f"The 200SMA is shown for reference but NOT used in the indicator (too slow for crypto).",
                 fontsize=9)
     save_slide(fig, "btc_moving_averages",
-               "BTC with key trend-following MAs. Golden cross (50>200) is one of the 7 BTC sub-signals in the regime model.")
+               "BTC with EMAs (21/50) used in the regime model plus 200SMA for reference. EMA cross is a key trend signal.")
 
     # --- Slide 17: Market Breadth ---
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(22, 8), sharex=True)
@@ -1300,10 +1303,10 @@ def make_all_charts(feat, bt, df_raw, ystats):
                "Top: 7-day average total market volume in billions. Bottom: 30-day z-score to detect unusual volume spikes.")
 
     # --- Slide 20: Individual BTC Sub-Signals Heatmap ---
-    btc_sig_cols = ["btc_s_trend", "btc_s_momentum", "btc_s_ma_cross",
-                    "btc_s_above_200ma", "btc_s_vol_level", "btc_s_vol_trend", "btc_s_midterm",
+    btc_sig_cols = ["btc_s_trend", "btc_s_momentum", "btc_s_ema_cross",
+                    "btc_s_above_50ema", "btc_s_vol_level", "btc_s_vol_trend", "btc_s_midterm",
                     "btc_s_rv_term", "btc_s_hurst_trend", "btc_s_vol_price"]
-    nice_btc = ["30d Trend", "7d Momentum", "Golden Cross", ">200MA", "Low Vol", "Vol Declining", "60d Trend",
+    nice_btc = ["30d Trend", "7d Momentum", "EMA Cross (21/50)", ">50 EMA", "Low Vol", "Vol Declining", "60d Trend",
                 "RV Term Str", "Hurst+Trend", "Vol-Price Confirm"]
     weekly = feat.set_index("time")[btc_sig_cols].resample("W").last().tail(52)
 
@@ -2694,7 +2697,7 @@ def print_report(feat, bt, ystats):
     print(f"\n  BTC SUB-SIGNALS")
     print(f"  {'─'*45}")
     for sig, name in [("btc_s_trend", "30d Trend"), ("btc_s_momentum", "7d Momentum"),
-                      ("btc_s_ma_cross", "Golden Cross"), ("btc_s_above_200ma", ">200MA"),
+                      ("btc_s_ema_cross", "EMA Cross 21/50"), ("btc_s_above_50ema", ">50 EMA"),
                       ("btc_s_vol_level", "Low Volatility"), ("btc_s_vol_trend", "Vol Declining"),
                       ("btc_s_midterm", "60d Trend"), ("btc_s_rv_term", "RV Term Str"),
                       ("btc_s_hurst_trend", "Hurst+Trend"), ("btc_s_vol_price", "Vol-Price")]:

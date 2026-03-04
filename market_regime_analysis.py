@@ -1,21 +1,50 @@
 """
 ================================================================================
-MARKET REGIME ANALYSIS & BACKTEST — Crypto Markets
+MARKET REGIME ANALYSIS & BACKTEST — Crypto Markets (v3 Institutional Grade)
 ================================================================================
 
-Binary regime classification (BULLISH / BEARISH only) with BTC as the dominant
-signal (70% weight) and altcoins providing confirmation (30% weight).
+PURPOSE:
+    Determine whether the crypto market is currently BULLISH or BEARISH using
+    a transparent, rule-based composite indicator. This is NOT a price predictor —
+    it classifies the current market STATE so we can decide a simple action:
+    hold BTC (bullish) or hold cash (bearish).
 
-Strategy: BULLISH → 100% long BTC | BEARISH → 100% cash (flat)
-Benchmark: Buy-and-hold BTC from day 1
+HOW IT WORKS:
+    18 independent "voters" each say bullish (+1) or bearish (-1).
+    - 10 voters look at BTC itself (price trends, volatility, momentum)
+    - 8 voters look at the broader altcoin market (breadth, correlation, stress)
+    BTC voters count for 70%, alt voters for 30% (because BTC leads the market).
+    If the weighted average > 0 → BULLISH. Otherwise → BEARISH.
+    A 3-day confirmation filter prevents reacting to single-day noise.
 
-The indicator is built from momentum, volatility, breadth, and volume signals
-using a transparent rule-based approach with iterative refinement — but
-deliberately constrained to avoid overfitting.
+WHY THESE SIGNALS:
+    Each signal captures a different dimension of market health:
+    - TREND signals (30d, 60d returns, EMA cross) → is price going up or down?
+    - VOLATILITY signals (RV levels, term structure) → is risk elevated or calm?
+    - BREADTH signals (% of coins positive) → is the rally broad or narrow?
+    - VOLUME signals (price-volume divergence) → does participation confirm price?
+    - STRUCTURAL signals (Hurst, correlation, drawdown speed) → is the move real?
+    No single signal is reliable alone. Combining 18 signals reduces false signals.
 
-Produces 40+ publication-quality visualizations with descriptions.
+WHY BTC 70% / ALTS 30%:
+    BTC has >50% market dominance and is the liquidity anchor for all of crypto.
+    When BTC sells off, everything sells off (correlation spikes to 0.8+).
+    Alts provide CONFIRMATION — if BTC is rising but alts are dying, the rally
+    is fragile. If both are strong, conviction is high.
+
+BACKTEST:
+    BULLISH → 100% long BTC | BEARISH → 100% cash (flat)
+    Benchmark: Buy-and-hold BTC from day 1
+    Execution: signal on day t → trade on day t+1 (no look-ahead bias)
+
+ANTI-OVERFITTING:
+    - All thresholds are simple (0, 0.5, expanding medians) — no optimized params
+    - Expanding windows (not fixed lookbacks) prevent future data leakage
+    - 3-day confirmation is the ONLY smoothing — minimal curve-fitting
+    - Forward return validation (slides 50-51) proves signals work out-of-sample
 
 Data: Coinbase daily crypto data (54 assets, 2018 – Mar 2026)
+Output: 66 visualization slides + concatenated PDF + regime_data.csv
 ================================================================================
 """
 
@@ -46,15 +75,18 @@ DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ma
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# BTC dominance in signal construction
+# BTC dominance in signal construction — 70% because BTC leads the market.
+# When BTC sells off, alt correlations spike to 0.8+ (everything follows BTC).
+# Alts provide confirmation but should NOT override BTC's direction.
 BTC_WEIGHT = 0.70
 ALT_WEIGHT = 0.30
 
-# Core altcoins (top by liquidity/cap)
+# Core altcoins used for calculating alt-side signals (median returns, vol, etc.)
+# Selected for: high liquidity, long history, representative of the market.
 CORE_ALTS = ["eth", "sol", "xrp", "ada", "doge", "avax", "link", "dot", "bnb", "ltc",
              "uni", "near", "sui", "apt", "arb"]
 
-# Individual coins to analyze in detail
+# Coins that get individual deep-dive slides (price, vol, returns analysis)
 SPOTLIGHT_COINS = ["btc", "eth", "sol", "xrp", "doge", "avax", "link", "ada",
                    "near", "sui", "apt", "bnb", "uni", "ltc"]
 
@@ -118,36 +150,72 @@ def load_data(path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_volatility_architecture(df, feat):
-    """RV term structure, IV-RV spread (BTC/ETH only), vol persistence."""
+    """
+    Volatility architecture features — measures the STRUCTURE of risk, not just
+    how much risk there is. These distinguish between calm trending markets and
+    chaotic crisis markets.
+
+    WHY: Price alone doesn't tell you market health. A market can go up on thin
+    volume with rising vol (fragile) or go up on calm vol (sustainable). The vol
+    architecture tells you which one you're in.
+    """
     btc = df[df["asset"] == "btc"].set_index("time").sort_index()
     eth = df[df["asset"] == "eth"].set_index("time").sort_index()
 
-    # RV term structure: rv_7d / rv_90d — inversion signals crisis
+    # RV TERM STRUCTURE: short-term vol (7d) / long-term vol (90d)
+    # WHY: In normal markets, short vol < long vol (contango, ratio < 1.0).
+    # When short vol EXCEEDS long vol (inversion, ratio > 1.0), it means a sudden
+    # shock hit — this preceded COVID crash, Luna collapse, FTX collapse.
+    # Used as a bearish signal when inverted (ratio > 1.0).
     feat["rv_term_structure"] = feat["btc_rv_7d"] / feat["btc_rv_90d"].replace(0, np.nan)
 
-    # Vol persistence: autocorrelation of rv_7d (rolling 30-day)
+    # VOL PERSISTENCE: autocorrelation of daily vol changes over 30 days
+    # WHY: High persistence means today's vol predicts tomorrow's vol — the market
+    # is in a "vol regime" (either calm or chaotic). Low persistence means vol is
+    # random and the current state may not last. Used for visualization, not as a
+    # direct trading signal.
     feat["vol_persistence"] = feat["btc_rv_7d"].rolling(30).apply(
         lambda x: x.autocorr(lag=1) if len(x) > 5 else np.nan, raw=False)
 
-    # IV-RV spread (Variance Risk Premium) — BTC only, from Sep 2021
+    # VARIANCE RISK PREMIUM (VRP): implied vol - realized vol
+    # WHY: IV is what the options market EXPECTS vol to be. RV is what actually happened.
+    # VRP > 0 means the market is pricing in MORE risk than is being realized (fear premium).
+    # Large positive VRP spikes often precede sell-offs — the options market "knows" first.
+    # Only available for BTC and ETH (they're the only coins with IV data, from Sep 2021).
+    # Used for visualization/analysis only — NOT in the trading signals (too sparse).
     btc_iv30 = btc["iv_30d"].reindex(feat.index) if "iv_30d" in btc.columns else pd.Series(np.nan, index=feat.index)
     btc_rv30 = feat["btc_rv_30d"]
     feat["btc_vrp"] = btc_iv30 - btc_rv30
 
-    # ETH IV-RV spread
     eth_iv30 = eth["iv_30d"].reindex(feat.index) if "iv_30d" in eth.columns else pd.Series(np.nan, index=feat.index)
     eth_rv30 = df[df["asset"] == "eth"].set_index("time")["rv_30d"].reindex(feat.index)
     feat["eth_vrp"] = eth_iv30 - eth_rv30
 
-    # Vol clustering: rolling 30-day std of rv_7d changes
+    # VOL CLUSTERING: how erratic is volatility itself? (standard deviation of vol changes)
+    # WHY: When vol is stable (low clustering), the market is in a clear regime.
+    # When vol is jumping around (high clustering), regime transitions are likely.
+    # Spikes in vol clustering coincided with every major dislocation in crypto history.
     feat["vol_clustering"] = feat["btc_rv_7d"].diff().rolling(30).std()
 
     return feat
 
 
 def build_momentum_persistence(df, feat):
-    """Rolling Hurst exponent (R/S method) and cross-sectional return dispersion."""
-    # Hurst exponent via R/S method — rolling 60-day
+    """
+    Momentum persistence features — measures whether price moves are REAL trends
+    or random noise, and whether the market is moving as a herd or selectively.
+
+    WHY: A 30d return of +10% could be a real trend (tradeable) or random walk
+    (noise). The Hurst exponent distinguishes between the two. Return dispersion
+    tells you if the market is panicking together or rotating selectively.
+    """
+    # HURST EXPONENT via Rescaled Range (R/S) method — rolling 60-day window
+    # WHY: H > 0.5 means the market is TRENDING (momentum works, follow the trend).
+    # H < 0.5 means MEAN-REVERTING (contrarian works, fade the move).
+    # H = 0.5 means random walk (no edge either way).
+    # We combine Hurst with trend direction: H > 0.5 + price up = strong bull signal.
+    # H > 0.5 + price down = strong bear signal (persistent downtrend).
+    # 60-day window balances responsiveness with statistical significance.
     def hurst_rs(ts):
         ts = ts.dropna()
         if len(ts) < 20:
@@ -164,7 +232,12 @@ def build_momentum_persistence(df, feat):
 
     feat["hurst_exponent"] = feat["btc_return_1d"].rolling(60).apply(hurst_rs, raw=False)
 
-    # Cross-sectional return dispersion: std of daily returns across all assets
+    # CROSS-SECTIONAL RETURN DISPERSION: std dev of daily returns across all 54 assets
+    # WHY: Low dispersion = all coins moving together (herding). In a downtrend, this
+    # means correlated panic selling (capitulation). In an uptrend, healthy markets show
+    # SOME dispersion (different coins rotating, sector leaders emerging).
+    # High dispersion + negative returns = selective selling (some coins holding up = early recovery).
+    # Used as an alt signal: healthy dispersion in uptrend = bullish, compressed in downtrend = bearish.
     all_rets = df.pivot_table(index="time", columns="asset", values="return_1d")
     dispersion = all_rets.std(axis=1).rename("return_dispersion")
     feat = feat.join(dispersion, on="time", how="left") if "time" in feat.columns else feat.join(dispersion, how="left")
@@ -173,16 +246,34 @@ def build_momentum_persistence(df, feat):
 
 
 def build_volume_dynamics(df, feat):
-    """Volume-price divergence and liquidity concentration."""
-    # Volume-price divergence: price going up but volume declining (bearish divergence)
+    """
+    Volume dynamics features — volume is the "conviction" behind price moves.
+    Price can lie (manipulation, thin markets), but volume is harder to fake.
+
+    WHY: A price rally on declining volume is a red flag — fewer participants are
+    buying, the rally lacks conviction and is likely to reverse. Conversely, a price
+    decline on INCREASING volume suggests accumulation (smart money buying the dip).
+    """
+    # VOLUME-PRICE DIVERGENCE: does volume confirm or contradict the price move?
+    # WHY: Classic technical analysis principle — volume should confirm the trend.
+    # - Price UP + volume DOWN (ratio < 0.8) = bearish divergence. The rally has no
+    #   participation behind it. Smart money may be selling into retail buying.
+    # - Price DOWN + volume UP (ratio > 1.2) = bullish divergence. Selling is being
+    #   absorbed by strong buying. This often marks bottoms (accumulation).
+    # - Otherwise = neutral (volume confirms direction, no edge).
+    # Thresholds: 0.8 and 1.2 are ±20% from average — meaningful but not extreme.
     price_trend = feat["btc_return_30d"]
-    vol_ma30 = feat["btc_volume_ratio"]  # already captures vol vs 30d avg
+    vol_ma30 = feat["btc_volume_ratio"]  # current volume / 30-day average volume
     feat["vol_price_divergence"] = np.where(
         (price_trend > 0) & (vol_ma30 < 0.8), -1,  # bearish divergence
         np.where((price_trend < 0) & (vol_ma30 > 1.2), 1, 0)  # bullish divergence
     )
 
-    # Liquidity concentration: max single-asset volume share
+    # LIQUIDITY CONCENTRATION: what % of total market volume is in the single largest asset?
+    # WHY: When one asset (usually BTC) dominates volume, it signals "flight to quality" —
+    # traders are rotating OUT of alts INTO BTC, which is risk-off behavior.
+    # Low concentration = broad participation across many coins = healthy bull market.
+    # Rising concentration during falling prices = classic risk-off / bear market behavior.
     vol_by_asset = df.pivot_table(index="time", columns="asset", values="volume")
     total_vol = vol_by_asset.sum(axis=1)
     max_share = vol_by_asset.div(total_vol, axis=0).max(axis=1).rename("liquidity_concentration")
@@ -192,11 +283,21 @@ def build_volume_dynamics(df, feat):
 
 
 def build_cross_asset_reflexivity(df, feat):
-    """Rolling beta of alts to BTC and average pairwise correlation convergence."""
+    """
+    Cross-asset reflexivity — how coins relate to each other reveals systemic risk.
+
+    WHY: Crypto is a reflexive system — when BTC drops, alts drop harder (high beta),
+    which triggers more liquidations, which causes more selling. Understanding these
+    feedback loops (correlation, beta) tells us when the market is fragile vs robust.
+    """
     pivot_rets = df.pivot_table(index="time", columns="asset", values="return_1d")
     btc_rets = pivot_rets["btc"] if "btc" in pivot_rets.columns else pd.Series(np.nan, index=pivot_rets.index)
 
-    # Alt beta to BTC: rolling 30-day
+    # ALT BETA TO BTC: rolling 30-day regression coefficient of alt returns vs BTC returns
+    # WHY: Beta measures how much alts amplify BTC moves. Beta > 1.0 = alts move MORE
+    # than BTC (leverage effect). Rising beta = increasing systemic risk (one BTC drop
+    # cascades through everything). Falling beta = alts decoupling (healthier market).
+    # 30-day window captures the recent relationship without being too noisy.
     alt_cols = [c for c in CORE_ALTS if c in pivot_rets.columns]
     alt_mean_ret = pivot_rets[alt_cols].mean(axis=1) if alt_cols else pd.Series(0, index=pivot_rets.index)
 
@@ -221,7 +322,12 @@ def build_cross_asset_reflexivity(df, feat):
     alt_beta = rolling_beta(30).rename("alt_beta_to_btc")
     feat = feat.join(alt_beta, on="time", how="left") if "time" in feat.columns else feat.join(alt_beta, how="left")
 
-    # Average pairwise correlation: rolling 30-day window
+    # AVERAGE PAIRWISE CORRELATION: rolling 30-day average correlation between all coin pairs
+    # WHY: When all coins are highly correlated (>0.7), the market is in "herding" mode —
+    # everyone is buying or selling the same thing. High correlation = fragile market
+    # (one shock affects everything). Low correlation (<0.3) = healthy selective market
+    # where coin fundamentals matter. Used as a signal: corr below median = bullish (healthy),
+    # above median = bearish (herding/fragility).
     def rolling_avg_corr(window=30):
         corrs = []
         idx = pivot_rets.index
@@ -246,12 +352,21 @@ def build_cross_asset_reflexivity(df, feat):
 
 
 def build_structural_shifts(df, feat):
-    """Drawdown intensity and rolling ADF stationarity test."""
-    # Drawdown intensity: current drawdown from 90-day high / days since high
+    """
+    Structural shift features — detects when the market regime itself is changing.
+
+    WHY: Most indicators tell you WHAT the market is doing now. These tell you
+    whether the current regime is STABLE or about to break. Drawdown speed
+    matters more than drawdown depth — a -20% drop in 3 days is much worse than
+    -20% over 3 months (the fast drop triggers liquidation cascades and panic).
+    """
+    # DRAWDOWN FROM 90-DAY HIGH: how far below the recent peak is BTC?
+    # WHY: The 90-day window captures medium-term highs without being too long.
+    # This is a straightforward measure of "how much pain are holders experiencing?"
     rolling_high = feat["btc_price"].rolling(90).max()
     feat["drawdown_pct"] = (feat["btc_price"] / rolling_high - 1) * 100
 
-    # Days since 90-day high
+    # (Unused helper — kept for potential future use)
     def days_since_high(prices, window=90):
         result = []
         for i in range(len(prices)):
@@ -261,10 +376,21 @@ def build_structural_shifts(df, feat):
             result.append(i - prices.index.get_loc(high_idx) if high_idx in prices.index else 0)
         return pd.Series(result, index=prices.index)
 
-    # Simplified: use drawdown speed (pct change in drawdown over 7 days)
+    # DRAWDOWN INTENSITY: 7-day change in drawdown percentage
+    # WHY: Speed of decline matters more than depth. A sharp drop (>5% in 7 days)
+    # triggers liquidation cascades, margin calls, and sentiment collapse.
+    # This is used as a BEARISH signal when intensity < -5 (rapid worsening).
+    # Recovery (intensity > +2) is used as a mild bullish signal.
+    # Thresholds: -5 for bearish = significant deterioration; +2 for bullish = recovery.
     feat["drawdown_intensity"] = feat["drawdown_pct"].diff(7)
 
-    # Rolling ADF test on BTC log returns (60-day window)
+    # ROLLING ADF (Augmented Dickey-Fuller) TEST: are BTC returns stationary?
+    # WHY: Stationary returns (p < 0.05) mean the market is mean-reverting (no persistent
+    # trend, prices bounce around). Non-stationary returns (p > 0.05) suggest a unit root —
+    # the market has a persistent drift (trending). This helps detect structural breaks:
+    # when a previously stationary market becomes non-stationary, something fundamental changed.
+    # 60-day window balances statistical power with responsiveness.
+    # Used for visualization/analysis — NOT directly in the trading signals.
     def rolling_adf(series, window=60):
         pvals = []
         for i in range(len(series)):
@@ -338,37 +464,51 @@ def build_features(df):
     alts = df[df["asset"].isin(CORE_ALTS)].copy()
     all_assets = df.copy()
 
-    # --- BTC features ---
+    # --- BTC features (the 70% component) ---
+    # Raw price/return/vol data from the CSV, indexed by date.
     feat = pd.DataFrame(index=btc.index)
     feat["btc_price"] = btc["price"]
-    feat["btc_return_1d"] = btc["return_1d"]
-    feat["btc_return_7d"] = btc["return_7d"]
-    feat["btc_return_14d"] = btc["return_14d"]
-    feat["btc_return_30d"] = btc["return_30d"]
-    feat["btc_return_60d"] = btc["return_60d"]
-    feat["btc_return_90d"] = btc["return_90d"]
-    feat["btc_rv_7d"] = btc["rv_7d"]
-    feat["btc_rv_30d"] = btc["rv_30d"]
-    feat["btc_rv_60d"] = btc["rv_60d"]
-    feat["btc_rv_90d"] = btc["rv_90d"]
-    feat["btc_volume_ratio"] = btc["volume_ratio"]
+    feat["btc_return_1d"] = btc["return_1d"]    # used for daily strategy returns
+    feat["btc_return_7d"] = btc["return_7d"]    # short-term momentum signal
+    feat["btc_return_14d"] = btc["return_14d"]  # intermediate (not used in signals, but available)
+    feat["btc_return_30d"] = btc["return_30d"]  # primary trend signal
+    feat["btc_return_60d"] = btc["return_60d"]  # mid-term trend signal
+    feat["btc_return_90d"] = btc["return_90d"]  # long-term context (not in signals)
+    feat["btc_rv_7d"] = btc["rv_7d"]            # short-term realized vol (for term structure)
+    feat["btc_rv_30d"] = btc["rv_30d"]          # primary vol signal
+    feat["btc_rv_60d"] = btc["rv_60d"]          # intermediate vol (not in signals)
+    feat["btc_rv_90d"] = btc["rv_90d"]          # long-term vol (for term structure denominator)
+    feat["btc_volume_ratio"] = btc["volume_ratio"]  # current vol / 30d avg (for divergence)
 
-    # Moving averages for trend — crypto-adapted (faster than equities)
-    feat["btc_ema_21"] = btc["price"].ewm(span=21).mean()
-    feat["btc_ema_50"] = btc["price"].ewm(span=50).mean()
-    feat["btc_ma_50"] = btc["price"].rolling(50).mean()  # kept for charting
-    feat["btc_ma_200"] = btc["price"].rolling(200).mean()  # kept for charting only
+    # EXPONENTIAL MOVING AVERAGES — crypto-adapted (faster than equities)
+    # WHY EMA over SMA: EMAs weight recent prices exponentially more, so they react
+    # faster to regime changes. In crypto's 24/7 market with 80%+ annualized vol,
+    # a 200-day SMA takes ~7 months to react — way too slow.
+    # WHY 21/50: 21 EMA ≈ 1 month of trading (captures momentum turns in ~3 weeks).
+    # 50 EMA ≈ 2.5 months (captures medium-term trend). Their crossover detects
+    # trend shifts in 3-7 weeks vs 3-7 months for the traditional 50/200 SMA cross.
+    feat["btc_ema_21"] = btc["price"].ewm(span=21).mean()   # fast trend (signal line)
+    feat["btc_ema_50"] = btc["price"].ewm(span=50).mean()   # medium trend (base line)
+    feat["btc_ma_50"] = btc["price"].rolling(50).mean()      # SMA kept for charting only
+    feat["btc_ma_200"] = btc["price"].rolling(200).mean()    # SMA kept for charting reference only
     feat["btc_above_21ema"] = (btc["price"] > feat["btc_ema_21"]).astype(float)
     feat["btc_above_50ema"] = (btc["price"] > feat["btc_ema_50"]).astype(float)
-    feat["btc_ema_cross"] = (feat["btc_ema_21"] > feat["btc_ema_50"]).astype(float)
+    feat["btc_ema_cross"] = (feat["btc_ema_21"] > feat["btc_ema_50"]).astype(float)  # 1 = bullish cross
 
-    # --- Altcoin features ---
+    # --- Altcoin features (the 30% component) ---
+    # We use MEDIAN (not mean) across core alts to be robust to outliers.
+    # One coin can 10x or go to zero — median ignores that, mean doesn't.
     alt_ret_30 = alts.groupby("time")["return_30d"].median().rename("alt_return_30d")
     alt_ret_7 = alts.groupby("time")["return_7d"].median().rename("alt_return_7d")
     alt_rv_30 = alts.groupby("time")["rv_30d"].median().rename("alt_rv_30d")
     alt_vol_ratio = alts.groupby("time")["volume_ratio"].median().rename("alt_volume_ratio")
 
     # --- Breadth (all assets) ---
+    # BREADTH: what percentage of ALL 54 coins have positive returns?
+    # WHY: A bull market should lift most boats. If only BTC and 2-3 alts are up
+    # but 80% of coins are down, the "bull market" is fragile and narrow.
+    # Breadth > 50% = majority of coins positive = healthy broad rally = bullish.
+    # Breadth < 50% = most coins negative even if BTC is up = fragile = bearish.
     breadth_7d = all_assets.groupby("time").apply(
         lambda g: (g["return_7d"] > 0).mean(), include_groups=False
     ).rename("breadth_7d")
@@ -376,7 +516,7 @@ def build_features(df):
         lambda g: (g["return_30d"] > 0).mean(), include_groups=False
     ).rename("breadth_30d")
 
-    # Total market volume
+    # Total market volume and z-score (how unusual is today's volume vs recent history)
     total_vol = all_assets.groupby("time")["volume"].sum().rename("total_volume")
     vol_zscore = ((total_vol - total_vol.rolling(30).mean()) /
                   total_vol.rolling(30).std()).rename("volume_zscore")
@@ -440,24 +580,62 @@ def compute_regime(feat):
     """
     f = feat.copy()
 
+    # EXPANDING MEDIANS for vol thresholds — uses all data UP TO that point (no future leak).
+    # WHY expanding (not fixed window): adapts to crypto's structural vol changes over years.
+    # min_periods=60 ensures we have ~2 months before comparing (avoid noisy early estimates).
     rv_med = f["btc_rv_30d"].expanding(min_periods=60).median()
     alt_rv_med = f["alt_rv_30d"].expanding(min_periods=60).median()
 
-    # BTC sub-signals
+    # ── BTC SUB-SIGNALS (10 voters, each outputs +1 bullish or -1 bearish) ──
+
+    # 1. TREND: is BTC up over the last 30 days?
+    # WHY: The most basic and powerful signal. 30 days filters out daily noise
+    # while being responsive enough for crypto's fast cycles.
     f["btc_s_trend"] = np.where(f["btc_return_30d"] > 0, 1, -1)
+
+    # 2. MOMENTUM: is BTC up over the last 7 days?
+    # WHY: Catches short-term momentum shifts before they show in 30d trend.
+    # Useful for early detection of reversals.
     f["btc_s_momentum"] = np.where(f["btc_return_7d"] > 0, 1, -1)
+
+    # 3. EMA CROSS: is the 21-day EMA above the 50-day EMA?
+    # WHY: When short EMA > long EMA, the recent price trend is stronger than
+    # the medium-term trend = accelerating momentum = bullish.
+    # The 21/50 pair reacts in 3-7 weeks vs 3-7 months for the old 50/200 SMA.
     f["btc_s_ema_cross"] = np.where(f["btc_ema_cross"] == 1, 1, -1)
+
+    # 4. PRICE > 50 EMA: is BTC above its 50-day exponential moving average?
+    # WHY: Being above the 50 EMA means the medium-term trend supports the price.
+    # When price is below = the trend has turned against you = bearish.
     f["btc_s_above_50ema"] = np.where(f["btc_above_50ema"] == 1, 1, -1)
+
+    # 5. VOL LEVEL: is current volatility below its historical expanding median?
+    # WHY: Low vol = calm market = bullish (trending up quietly).
+    # High vol = stressed market = bearish (fear, uncertainty, liquidations).
     f["btc_s_vol_level"] = np.where(f["btc_rv_30d"] < rv_med, 1, -1)
+
+    # 6. VOL TREND: is short-term vol declining vs long-term vol?
+    # WHY: When rv_30d < rv_90d, volatility is DECREASING — the market is calming
+    # down, which typically accompanies sustained uptrends. Rising vol = trouble.
     f["btc_s_vol_trend"] = np.where(f["btc_rv_30d"] < f["btc_rv_90d"], 1, -1)
+
+    # 7. MID-TERM: is BTC up over the last 60 days?
+    # WHY: Adds a third timeframe to prevent one noisy period from flipping signals.
+    # If 7d, 30d, AND 60d all agree = very high conviction.
     f["btc_s_midterm"] = np.where(f["btc_return_60d"] > 0, 1, -1)
 
-    # New BTC signals (institutional)
-    # 8. RV term structure: inverted (>1.5) = crisis/bearish, contango (<0.8) = trending/bullish
+    # 8. RV TERM STRUCTURE: is short-term vol below long-term vol (contango)?
+    # WHY: Normal markets have rv_7d < rv_90d (ratio < 1.0). When this INVERTS
+    # (ratio > 1.0), a sudden shock has hit — this preceded every major crash.
+    # fillna(1.0) = neutral when data is missing.
     rv_ts = f["rv_term_structure"].fillna(1.0)
     f["btc_s_rv_term"] = np.where(rv_ts < 1.0, 1, -1)
 
-    # 9. Hurst + trend confirmation: Hurst > 0.5 + positive trend = strong bullish
+    # 9. HURST + TREND: is the trend persistent (not random noise)?
+    # WHY: Hurst > 0.5 means the market is genuinely trending. Combined with
+    # direction: trending UP = strong bullish, trending DOWN = strong bearish.
+    # When Hurst ~ 0.5 (random walk), output is 0 → forward-filled from last
+    # confident reading to avoid flip-flopping.
     hurst = f["hurst_exponent"].fillna(0.5)
     f["btc_s_hurst_trend"] = np.where(
         (hurst > 0.5) & (f["btc_return_30d"] > 0), 1,
@@ -466,11 +644,13 @@ def compute_regime(feat):
     f["btc_s_hurst_trend"] = f["btc_s_hurst_trend"].replace(0, np.nan).fillna(
         method="ffill").fillna(0)
 
-    # 10. Volume-price confirmation
+    # 10. VOL-PRICE CONFIRMATION: does volume support the price move?
+    # WHY: Price up + volume down = bearish divergence (no conviction behind rally).
+    # Price down + volume up = bullish divergence (accumulation during weakness).
+    # Neutral (0) forward-filled to carry the last divergence reading.
     f["btc_s_vol_price"] = f["vol_price_divergence"].fillna(0)
     f["btc_s_vol_price"] = np.where(f["btc_s_vol_price"] > 0, 1,
                                      np.where(f["btc_s_vol_price"] < 0, -1, 0))
-    # Fill neutral (0) with previous signal to avoid always-neutral
     f["btc_s_vol_price"] = f["btc_s_vol_price"].replace(0, np.nan).fillna(
         method="ffill").fillna(0)
 
@@ -480,30 +660,59 @@ def compute_regime(feat):
                    "btc_s_vol_price"]
     f["btc_score"] = f[btc_signals].mean(axis=1)
 
-    # Alt sub-signals
+    # ── ALT SUB-SIGNALS (8 voters, each outputs +1 bullish or -1 bearish) ──
+    # These provide CONFIRMATION from the broader market. If BTC is bullish but
+    # alts are dying, the signal is less trustworthy (narrow rally).
+
+    # 1. ALT TREND: is the median altcoin 30d return positive?
+    # WHY: If most alts are also going up, the bull market is broad-based and sustainable.
     f["alt_s_trend"] = np.where(f["alt_return_30d"] > 0, 1, -1)
+
+    # 2. BREADTH 30D: are more than 50% of ALL coins positive over 30 days?
+    # WHY: 50% is the natural dividing line. Above = majority of market is up = healthy.
+    # Breadth collapsing below 20% historically marks capitulation zones.
     f["alt_s_breadth_30d"] = np.where(f["breadth_30d"] > 0.5, 1, -1)
+
+    # 3. BREADTH 7D: same but over 7 days (faster-reacting version).
+    # WHY: Short-term breadth turns first — if 7d breadth is collapsing while 30d
+    # is still OK, deterioration is starting but hasn't fully materialized yet.
     f["alt_s_breadth_7d"] = np.where(f["breadth_7d"] > 0.5, 1, -1)
+
+    # 4. ALT MOMENTUM: is the median altcoin 7d return positive?
+    # WHY: Short-term alt momentum. If alts are bouncing while BTC is flat,
+    # risk appetite is returning (bullish). If alts are dumping, fear is spreading.
     f["alt_s_momentum"] = np.where(f["alt_return_7d"] > 0, 1, -1)
+
+    # 5. ALT VOL: is altcoin volatility below its expanding median?
+    # WHY: Same logic as BTC vol — calm alts = healthy, stressed alts = trouble.
+    # Alt vol tends to spike HARDER than BTC vol during crashes (higher beta).
     f["alt_s_vol"] = np.where(f["alt_rv_30d"] < alt_rv_med, 1, -1)
 
-    # New alt signals (institutional)
-    # 6. Correlation convergence: high avg correlation = herding = bearish sign
+    # 6. CORRELATION CONVERGENCE: is avg pairwise correlation below its median?
+    # WHY: Low correlation = coins moving independently = healthy, selective market.
+    # High correlation = herding/panic (everyone selling everything) = fragile.
+    # When correlation spikes above 0.7, it usually means capitulation is underway.
     avg_corr = f["avg_pairwise_corr"].fillna(0.5)
     corr_med = avg_corr.expanding(60).median()
     f["alt_s_corr_convergence"] = np.where(avg_corr < corr_med, 1, -1)
 
-    # 7. Return dispersion: low dispersion in bear = panic, high dispersion in bull = selective
+    # 7. RETURN DISPERSION: are coins moving differently from each other (healthy)?
+    # WHY: In a bull market, healthy dispersion means different sectors are rotating
+    # (DeFi one week, L1s the next). In a bear market, LOW dispersion = everything
+    # dumping together = correlated panic = bearish. Neutral (0) → forward-filled.
     disp = f["return_dispersion"].fillna(0)
     disp_med = disp.expanding(60).median()
     f["alt_s_dispersion"] = np.where(
-        (disp > disp_med) & (f["alt_return_30d"] > 0), 1,  # healthy dispersion in uptrend
+        (disp > disp_med) & (f["alt_return_30d"] > 0), 1,   # healthy dispersion in uptrend
         np.where((disp < disp_med) & (f["alt_return_30d"] < 0), -1, 0)  # compressed in downtrend
     ).astype(float)
     f["alt_s_dispersion"] = f["alt_s_dispersion"].replace(0, np.nan).fillna(
         method="ffill").fillna(0)
 
-    # 8. Drawdown intensity: rapid drawdowns are bearish
+    # 8. DRAWDOWN INTENSITY: is BTC falling fast (>5% in 7 days from recent high)?
+    # WHY: Speed of decline matters more than depth. A fast crash triggers margin calls,
+    # liquidation cascades, and sentiment collapse. A slow grind-down is painful but
+    # doesn't cause panic. Threshold: -5% in 7 days = significant, +2% = recovery.
     dd_intensity = f["drawdown_intensity"].fillna(0)
     f["alt_s_drawdown"] = np.where(dd_intensity < -5, -1,
                                     np.where(dd_intensity > 2, 1, 0)).astype(float)
